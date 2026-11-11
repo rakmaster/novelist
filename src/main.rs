@@ -10,6 +10,7 @@ mod recents;
 mod search;
 mod spell;
 mod templates;
+mod theme;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {

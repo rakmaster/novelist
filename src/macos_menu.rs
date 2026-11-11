@@ -1,8 +1,9 @@
-//! Native macOS menu bar (File/Edit only) via muda.
+//! Native macOS menu bar via muda.
 //!
 //! egui has no native menu integration, so these menus are installed once and
 //! their events are polled each frame from `App::ui`.
 
+use crate::editor::FormatCmd;
 use muda::accelerator::{Accelerator, Code, Modifiers};
 use muda::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 
@@ -23,6 +24,7 @@ pub enum MenuAction {
     ToggleSpell,
     Settings,
     CleanSpacing,
+    Format(FormatCmd),
 }
 
 impl MenuAction {
@@ -43,6 +45,14 @@ impl MenuAction {
             "spell_on" => Self::ToggleSpell,
             "settings" => Self::Settings,
             "clean_spacing" => Self::CleanSpacing,
+            "fmt_bold" => Self::Format(FormatCmd::Bold),
+            "fmt_italic" => Self::Format(FormatCmd::Italic),
+            "fmt_underline" => Self::Format(FormatCmd::Underline),
+            "fmt_h1" => Self::Format(FormatCmd::Heading(1)),
+            "fmt_h2" => Self::Format(FormatCmd::Heading(2)),
+            "fmt_h3" => Self::Format(FormatCmd::Heading(3)),
+            "fmt_ul" => Self::Format(FormatCmd::UnorderedList),
+            "fmt_ol" => Self::Format(FormatCmd::OrderedList),
             _ => return None,
         })
     }
@@ -122,7 +132,21 @@ impl NativeMenu {
             &spell_on,
         ]);
 
-        let _ = menu.append_items(&[&app_menu, &file_menu, &edit_menu]);
+        let format_menu = Submenu::new("Format", true);
+        let _ = format_menu.append_items(&[
+            &item("fmt_bold", "Bold", accel(Code::KeyB)),
+            &item("fmt_italic", "Italic", accel(Code::KeyI)),
+            &item("fmt_underline", "Underline", accel(Code::KeyU)),
+            &sep(),
+            &item("fmt_h1", "Heading 1", None),
+            &item("fmt_h2", "Heading 2", None),
+            &item("fmt_h3", "Heading 3", None),
+            &sep(),
+            &item("fmt_ul", "Bulleted List", None),
+            &item("fmt_ol", "Numbered List", None),
+        ]);
+
+        let _ = menu.append_items(&[&app_menu, &file_menu, &edit_menu, &format_menu]);
         let _ = menu.init_for_nsapp();
 
         Self { _menu: menu, undo, spell_on }

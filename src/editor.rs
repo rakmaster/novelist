@@ -1,4 +1,4 @@
-use crate::format::{self, Style};
+use crate::format::{self, ListKind, Style};
 use crate::model::{Node, NodeId};
 use crate::search::{self, Query};
 use crate::spell::SpellChecker;
@@ -25,6 +25,8 @@ pub enum FormatCmd {
     Italic,
     Underline,
     Heading(u8),
+    UnorderedList,
+    OrderedList,
 }
 
 pub enum SpellAction {
@@ -37,7 +39,8 @@ pub struct Env<'a> {
     pub spell_actions: &'a mut Vec<SpellAction>,
     pub query: Option<&'a Query>,
     pub current: Option<(NodeId, Range<usize>)>,
-    pub fmt: Option<(NodeId, FormatCmd)>,
+    /// The egui text-edit ID targeted by a pending format command.
+    pub fmt: Option<(Id, FormatCmd)>,
     pub goto: Option<(NodeId, usize)>,
     pub font_size: f32,
     /// Standard manuscript layout: double-spaced, first-line indent, 6.5" column.
@@ -65,6 +68,7 @@ pub fn install_fonts(ctx: &egui::Context) {
             "../assets/fonts/NotoSans-Bold.ttf"
         ))),
     );
+    crate::theme::add_system_ui_font(&mut fonts);
     let fallback = fonts.families[&FontFamily::Proportional].clone();
     for name in [SERIF, SERIF_BOLD, SANS_BOLD] {
         let mut list = vec![name.to_string()];
@@ -128,7 +132,11 @@ fn build_job(
             ..Default::default()
         };
         let para_start = a == 0 || text.as_bytes()[a - 1] == b'\n';
-        let indent = if manuscript && para_start && style.heading == 0 { size * INDENT_EM } else { 0.0 };
+        let indent = if manuscript && para_start && style.heading == 0 && !style.list {
+            size * INDENT_EM
+        } else {
+            0.0
+        };
         if style.underline && !style.marker {
             fmt.underline = Stroke::new(1.0, color);
         }
@@ -141,7 +149,11 @@ fn build_job(
         } else if contains(highlights, a) {
             fmt.background = Color32::from_rgba_unmultiplied(255, 220, 0, 120);
         }
-        job.append(&text[a..b], indent, fmt);
+        if style.marker && style.list && text[a..b].trim_start().starts_with('-') {
+            job.append(&text[a..b].replacen('-', "\u{2022}", 1), indent, fmt);
+        } else {
+            job.append(&text[a..b], indent, fmt);
+        }
     }
     job
 }
@@ -154,34 +166,123 @@ fn char_to_byte(s: &str, c: usize) -> usize {
     s.char_indices().nth(c).map_or(s.len(), |(b, _)| b)
 }
 
+/// Apply a formatting command to the selection stored for text edit `id`.
+/// Returns true because every command changes the text, restores the resulting
+/// selection, and gives focus back to that edit.
+pub fn apply_format(ui: &egui::Ui, id: Id, text: &mut String, cmd: FormatCmd) -> bool {
+    let mut state = TextEditState::load(ui.ctx(), id).unwrap_or_default();
+    let sel = state
+        .cursor
+        .char_range()
+        .map(|r| {
+            let [a, b] = r.sorted_cursors();
+            a.index.0..b.index.0
+        })
+        .unwrap_or(0..0);
+    let new = match cmd {
+        FormatCmd::Bold => format::toggle_inline(text, sel, "**"),
+        FormatCmd::Italic => format::toggle_inline(text, sel, "*"),
+        FormatCmd::Underline => format::toggle_inline(text, sel, "__"),
+        FormatCmd::Heading(l) => format::toggle_heading(text, sel, l),
+        FormatCmd::UnorderedList => format::toggle_list(text, sel, ListKind::Unordered),
+        FormatCmd::OrderedList => format::toggle_list(text, sel, ListKind::Ordered),
+    };
+    state
+        .cursor
+        .set_char_range(Some(CCursorRange::two(CCursor::new(new.start), CCursor::new(new.end))));
+    state.store(ui.ctx(), id);
+    ui.memory_mut(|m| m.request_focus(id));
+    true
+}
+
+/// Tab / Shift+Tab on a list line nests / un-nests the selected list items.
+/// Returns true if the key was handled and the text changed.
+fn list_tab(ui: &egui::Ui, id: Id, text: &mut String) -> bool {
+    if !ui.memory(|m| m.has_focus(id)) || !ui.input(|i| i.key_pressed(Key::Tab)) {
+        return false;
+    }
+    let mut state = TextEditState::load(ui.ctx(), id).unwrap_or_default();
+    let sel = state
+        .cursor
+        .char_range()
+        .map(|r| {
+            let [a, b] = r.sorted_cursors();
+            a.index.0..b.index.0
+        })
+        .unwrap_or(0..0);
+    if !format::is_list_line(text, sel.start) {
+        return false;
+    }
+    let outdent = ui.input(|i| i.modifiers.shift);
+    ui.input_mut(|i| {
+        i.consume_key(Modifiers::NONE, Key::Tab);
+        i.consume_key(Modifiers::SHIFT, Key::Tab);
+    });
+    let new = format::shift_list_indent(text, sel, outdent);
+    state
+        .cursor
+        .set_char_range(Some(CCursorRange::two(CCursor::new(new.start), CCursor::new(new.end))));
+    state.store(ui.ctx(), id);
+    true
+}
+
+/// A multiline text edit using the same visual formatting as manuscript text.
+pub fn styled_multiline(
+    ui: &mut egui::Ui,
+    id: Id,
+    text: &mut String,
+    size: f32,
+    rows: usize,
+    hint: &str,
+) -> egui::WidgetAtomResponse {
+    let tabbed = list_tab(ui, id, text);
+    let color = ui.visuals().text_color();
+    let weak = ui.visuals().weak_text_color();
+    let mut layouter = |ui: &egui::Ui, text: &dyn TextBuffer, wrap: f32| {
+        let job = build_job(
+            text.as_str(),
+            wrap,
+            size,
+            None,
+            &[],
+            None,
+            color,
+            weak,
+            false,
+        );
+        ui.fonts_mut(|f| f.layout_job(job))
+    };
+    let mut out = egui::TextEdit::multiline(text)
+        .id(id)
+        .font(serif(false, size))
+        .hint_text(hint)
+        .desired_rows(rows)
+        .desired_width(f32::INFINITY)
+        .lock_focus(true)
+        .layouter(&mut layouter)
+        .show(ui)
+        .response;
+    if tabbed {
+        out.mark_changed();
+    }
+    out
+}
+
 /// Draw the multiline body editor of a section. Returns true if text changed.
-pub fn body_editor(ui: &mut egui::Ui, node: &mut Node, env: &mut Env, min_rows: usize) -> bool {
+pub fn body_editor(
+    ui: &mut egui::Ui,
+    node: &mut Node,
+    env: &mut Env,
+    min_rows: usize,
+    fmt_focus: &mut Option<Id>,
+) -> bool {
     let id = Id::unique(("body", node.id));
     let mut changed = false;
 
-    if let Some((_, cmd)) = env.fmt.take_if(|(n, _)| *n == node.id) {
-        let mut state = TextEditState::load(ui.ctx(), id).unwrap_or_default();
-        let sel = state
-            .cursor
-            .char_range()
-            .map(|r| {
-                let [a, b] = r.sorted_cursors();
-                a.index.0..b.index.0
-            })
-            .unwrap_or(0..0);
-        let new = match cmd {
-            FormatCmd::Bold => format::toggle_inline(&mut node.body, sel, "**"),
-            FormatCmd::Italic => format::toggle_inline(&mut node.body, sel, "*"),
-            FormatCmd::Underline => format::toggle_inline(&mut node.body, sel, "__"),
-            FormatCmd::Heading(l) => format::toggle_heading(&mut node.body, sel, l),
-        };
-        state
-            .cursor
-            .set_char_range(Some(CCursorRange::two(CCursor::new(new.start), CCursor::new(new.end))));
-        state.store(ui.ctx(), id);
-        ui.memory_mut(|m| m.request_focus(id));
-        changed = true;
+    if let Some((_, cmd)) = env.fmt.take_if(|(target, _)| *target == id) {
+        changed |= apply_format(ui, id, &mut node.body, cmd);
     }
+    changed |= list_tab(ui, id, &mut node.body);
 
     let spell = env.spell;
     let query = env.query;
@@ -292,6 +393,7 @@ pub fn body_editor(ui: &mut egui::Ui, node: &mut Node, env: &mut Env, min_rows: 
 
     if out.response.has_focus() {
         *env.last_focus = Some(node.id);
+        *fmt_focus = Some(id);
     }
     if let Some((_, byte)) = env.goto.take_if(|(n, _)| *n == node.id) {
         let c = CCursor::new(byte_to_char(&node.body, byte));

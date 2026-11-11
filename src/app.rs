@@ -130,6 +130,8 @@ pub struct App {
     scroll_request: Option<NodeId>,
     goto: Option<(NodeId, usize)>,
     last_focus: Option<NodeId>,
+    /// Text edit that receives toolbar/native-menu formatting commands.
+    fmt_focus: Option<egui::Id>,
     pending: Option<Pending>,
     allow_close: bool,
     message: String,
@@ -145,6 +147,7 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         editor::install_fonts(&cc.egui_ctx);
+        crate::theme::apply(&cc.egui_ctx);
         let book = Book::default();
         let selected = book.roots.first().map(|n| n.id);
         Self {
@@ -175,6 +178,7 @@ impl App {
             scroll_request: None,
             goto: None,
             last_focus: None,
+            fmt_focus: None,
             pending: None,
             allow_close: false,
             message: String::new(),
@@ -202,6 +206,7 @@ impl App {
         self.dirty = false;
         self.undo.clear();
         self.last_focus = None;
+        self.fmt_focus = None;
         self.launcher = false;
         self.launcher_error.clear();
     }
@@ -679,7 +684,7 @@ impl App {
         }
     }
 
-    fn world_ui(&mut self, ui: &mut egui::Ui) {
+    fn world_ui(&mut self, ui: &mut egui::Ui, mut fmt: Option<(egui::Id, FormatCmd)>) {
         let valid = self.selected_world.filter(|id| self.book.world.iter().any(|e| e.id == *id));
         let Some(id) = valid.or_else(|| self.book.world.first().map(|e| e.id)) else {
             ui.centered_and_justified(|ui| {
@@ -726,7 +731,7 @@ impl App {
         let mut jump: Option<Match> = None;
         let mut delete = false;
         let mut find_it: Option<String> = None;
-        let App { book, dirty, .. } = self;
+        let App { book, dirty, fmt_focus, font_size, .. } = self;
         let Some(e) = book.find_world_mut(id) else { return };
 
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
@@ -735,9 +740,11 @@ impl App {
                 let mut changed = false;
                 ui.label(egui::RichText::new("Category").weak().small());
                 ui.horizontal(|ui| {
-                    changed |= ui
-                        .add(egui::TextEdit::singleline(&mut e.category).desired_width(ui.available_width() - 90.0))
-                        .changed();
+                    let r = ui.add(egui::TextEdit::singleline(&mut e.category).desired_width(ui.available_width() - 90.0));
+                    if r.has_focus() {
+                        *fmt_focus = None;
+                    }
+                    changed |= r.changed();
                     ui.menu_button("Pick\u{2026} \u{25be}", |ui| {
                         for s in &suggestions {
                             if ui.button(s).clicked() {
@@ -753,26 +760,44 @@ impl App {
                     ("Other names (comma-separated; also counted as mentions)", &mut e.aliases, "e.g. regional names, nicknames"),
                 ] {
                     ui.label(egui::RichText::new(label).weak().small());
-                    changed |= ui
-                        .add(egui::TextEdit::singleline(text).hint_text(hint).desired_width(f32::INFINITY))
-                        .changed();
+                    let r = ui.add(egui::TextEdit::singleline(text).hint_text(hint).desired_width(f32::INFINITY));
+                    if r.has_focus() {
+                        *fmt_focus = None;
+                    }
+                    changed |= r.changed();
                 }
                 let prompt = crate::templates::hint_for(&e.category).unwrap_or("");
-                for (label, text, rows, hint) in [
-                    ("Description", &mut e.description, 12, prompt),
-                    ("Notes", &mut e.notes, 5, ""),
-                ] {
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new(label).weak().small());
-                    changed |= ui
-                        .add(
-                            egui::TextEdit::multiline(text)
-                                .hint_text(hint)
-                                .desired_rows(rows)
-                                .desired_width(f32::INFINITY),
-                        )
-                        .changed();
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Description").weak().small());
+                let description_id = egui::Id::unique(("world-description", id));
+                if let Some((_, cmd)) = fmt.take_if(|(target, _)| *target == description_id) {
+                    changed |= editor::apply_format(ui, description_id, &mut e.description, cmd);
                 }
+                let description = editor::styled_multiline(
+                    ui,
+                    description_id,
+                    &mut e.description,
+                    *font_size,
+                    12,
+                    prompt,
+                );
+                if description.has_focus() {
+                    *fmt_focus = Some(description_id);
+                }
+                changed |= description.changed();
+
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Notes").weak().small());
+                let notes = ui.add(
+                    egui::TextEdit::multiline(&mut e.notes)
+                        .lock_focus(true)
+                        .desired_rows(5)
+                        .desired_width(f32::INFINITY),
+                );
+                if notes.has_focus() {
+                    *fmt_focus = None;
+                }
+                changed |= notes.changed();
                 *dirty |= changed;
 
                 ui.add_space(8.0);
@@ -959,6 +984,7 @@ impl App {
                     changed |= ui
                         .add(
                             egui::TextEdit::multiline(text)
+                                .lock_focus(true)
                                 .desired_rows(rows)
                                 .desired_width(f32::INFINITY),
                         )
@@ -1254,7 +1280,7 @@ impl App {
 
     // ---------- document area ----------
 
-    fn document_ui(&mut self, ui: &mut egui::Ui, matches: &[Match], fmt: Option<FormatCmd>) {
+    fn document_ui(&mut self, ui: &mut egui::Ui, matches: &[Match], fmt: Option<(egui::Id, FormatCmd)>) {
         let App {
             book,
             spell,
@@ -1268,6 +1294,7 @@ impl App {
             scroll_request,
             goto,
             last_focus,
+            fmt_focus,
             dirty,
             ..
         } = self;
@@ -1284,7 +1311,6 @@ impl App {
             return;
         }
 
-        let target = last_focus.or(*selected);
         let current = if find.open {
             matches.get(find.current).map(|m| (m.node, m.range.clone()))
         } else {
@@ -1297,7 +1323,7 @@ impl App {
             spell_actions: &mut spell_actions,
             query,
             current,
-            fmt: target.zip(fmt),
+            fmt,
             goto: goto.take(),
             font_size: *font_size,
             manuscript: *manuscript_format,
@@ -1351,6 +1377,7 @@ impl App {
                     );
                     if t.has_focus() {
                         new_selected = Some(id);
+                        *fmt_focus = None;
                     }
                     *dirty |= t.changed();
 
@@ -1360,11 +1387,13 @@ impl App {
                             egui::TextEdit::multiline(&mut node.synopsis)
                                 .id(egui::Id::unique(("syn", id)))
                                 .hint_text("What happens in this section?")
+                                .lock_focus(true)
                                 .desired_rows(3)
                                 .desired_width(f32::INFINITY),
                         );
                         if s.has_focus() {
                             new_selected = Some(id);
+                            *fmt_focus = None;
                         }
                         *dirty |= s.changed();
                     }
@@ -1387,7 +1416,7 @@ impl App {
                         }
                         let rows = if single { 24 } else { 6 };
                         let before = env.last_focus.is_some_and(|f| f == id);
-                        *dirty |= editor::body_editor(ui, node, &mut env, rows);
+                        *dirty |= editor::body_editor(ui, node, &mut env, rows, fmt_focus);
                         if !before && env.last_focus.is_some_and(|f| f == id) {
                             new_selected = Some(id);
                         }
@@ -1813,6 +1842,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let mut fmt: Option<FormatCmd> = None;
 
         #[cfg(target_os = "macos")]
         {
@@ -1848,6 +1878,7 @@ impl eframe::App for App {
                     MenuAction::CheckSpelling => self.spell_open = true,
                     MenuAction::ToggleSpell => self.spell_on = !self.spell_on,
                     MenuAction::Settings => self.settings_open = true,
+                    MenuAction::Format(cmd) => fmt = Some(cmd),
                     MenuAction::CleanSpacing => {
                         self.clean_manuscript_spacing();
                     }
@@ -1861,7 +1892,6 @@ impl eframe::App for App {
         }
 
         // Shortcuts
-        let mut fmt: Option<FormatCmd> = None;
         let key = |k: Key| {
             ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, k)))
         };
@@ -2028,38 +2058,60 @@ impl eframe::App for App {
                 if ui.button("Settings…").clicked() {
                     self.settings_open = true;
                 }
-                #[cfg(not(target_os = "macos"))]
-                ui.separator();
-                for (label, cmd) in [
-                    ("B", FormatCmd::Bold),
-                    ("I", FormatCmd::Italic),
-                    ("U", FormatCmd::Underline),
-                    ("H1", FormatCmd::Heading(1)),
-                    ("H2", FormatCmd::Heading(2)),
-                    ("H3", FormatCmd::Heading(3)),
+                if self.side == Side::Editor {
+                    #[cfg(not(target_os = "macos"))]
+                    ui.separator();
+                    ui.selectable_value(&mut self.view, View::Chapter, "Section");
+                    ui.selectable_value(&mut self.view, View::Manuscript, "Manuscript");
+                }
+            });
+        });
+
+        egui::Panel::top("format_bar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.add_space(2.0);
+                for (label, cmd, hover) in [
+                    (egui::RichText::new("B").strong(), FormatCmd::Bold, "Bold (Cmd/Ctrl+B)"),
+                    (egui::RichText::new("I").italics(), FormatCmd::Italic, "Italic (Cmd/Ctrl+I)"),
+                    (egui::RichText::new("U").underline(), FormatCmd::Underline, "Underline (Cmd/Ctrl+U)"),
                 ] {
-                    let text = match cmd {
-                        FormatCmd::Bold => egui::RichText::new(label).strong(),
-                        FormatCmd::Italic => egui::RichText::new(label).italics(),
-                        FormatCmd::Underline => egui::RichText::new(label).underline(),
-                        _ => egui::RichText::new(label),
-                    };
                     if ui
-                        .add(
-                            egui::Button::new(text)
-                                .corner_radius(6)
-                                .min_size(vec2(26.0, 18.0)),
-                        )
+                        .add(egui::Button::new(label).min_size(vec2(30.0, 24.0)))
+                        .on_hover_text(hover)
                         .clicked()
                     {
                         fmt = Some(cmd);
                     }
                 }
-                if self.side == Side::Editor {
-                    ui.separator();
-                    ui.selectable_value(&mut self.view, View::Chapter, "Section");
-                    ui.selectable_value(&mut self.view, View::Manuscript, "Manuscript");
-                }
+                ui.separator();
+                egui::ComboBox::from_id_salt("fmt_heading")
+                    .selected_text("Heading")
+                    .width(96.0)
+                    .show_ui(ui, |ui| {
+                        for (label, cmd) in [
+                            ("Heading 1", FormatCmd::Heading(1)),
+                            ("Heading 2", FormatCmd::Heading(2)),
+                            ("Heading 3", FormatCmd::Heading(3)),
+                        ] {
+                            if ui.selectable_label(false, label).clicked() {
+                                fmt = Some(cmd);
+                            }
+                        }
+                    });
+                egui::ComboBox::from_id_salt("fmt_list")
+                    .selected_text("List")
+                    .width(96.0)
+                    .show_ui(ui, |ui| {
+                        for (label, cmd) in [
+                            ("\u{2022}  Bulleted list", FormatCmd::UnorderedList),
+                            ("1.  Numbered list", FormatCmd::OrderedList),
+                        ] {
+                            if ui.selectable_label(false, label).clicked() {
+                                fmt = Some(cmd);
+                            }
+                        }
+                    });
             });
         });
 
@@ -2117,9 +2169,10 @@ impl eframe::App for App {
             if self.find.open && self.find.focus {
                 self.side = Side::Editor;
             }
+            let fmt = self.fmt_focus.zip(fmt);
             match self.side {
                 Side::Characters => self.characters_ui(ui),
-                Side::World => self.world_ui(ui),
+                Side::World => self.world_ui(ui, fmt),
                 Side::Editor => self.document_ui(ui, &matches, fmt),
             }
         });

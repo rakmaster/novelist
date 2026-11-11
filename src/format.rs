@@ -1,5 +1,6 @@
 //! Lightweight Markdown-style inline formatting stored directly in chapter text:
-//! `**bold**`, `*italic*`, `__underline__`, and `#`/`##`/`###` heading lines.
+//! `**bold**`, `*italic*`, `__underline__`, `#`/`##`/`###` heading lines,
+//! and `-`/`1.` list lines.
 
 use std::ops::Range;
 
@@ -9,8 +10,16 @@ pub struct Style {
     pub italic: bool,
     pub underline: bool,
     pub heading: u8,
+    /// True for list item lines.
+    pub list: bool,
     /// True for the formatting characters themselves (shown dimmed).
     pub marker: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListKind {
+    Unordered,
+    Ordered,
 }
 
 /// Split `text` into consecutive styled byte ranges covering the whole string.
@@ -32,11 +41,19 @@ pub fn spans(text: &str) -> Vec<(Range<usize>, Style)> {
     let mut line_start = 0;
     for line in text.split_inclusive('\n') {
         let heading = heading_level(line);
-        let base = Style { heading, ..Style::default() };
+        let list = list_marker(line);
+        let base = Style {
+            heading,
+            list: list.is_some(),
+            ..Style::default()
+        };
         let mut cur = base;
         let mut i = 0;
         if heading > 0 {
             let n = heading as usize + 1;
+            push(line_start..line_start + n, Style { marker: true, ..base });
+            i = n;
+        } else if let Some((_, n)) = list {
             push(line_start..line_start + n, Style { marker: true, ..base });
             i = n;
         }
@@ -77,6 +94,77 @@ fn heading_level(line: &str) -> u8 {
     0
 }
 
+const INDENT: &str = "    ";
+
+fn indent_len(line: &str) -> usize {
+    line.len() - line.trim_start_matches([' ', '\t']).len()
+}
+
+/// Return the list kind and byte length (including any leading indent) of a
+/// `- ` or `N. ` marker.
+fn list_marker(line: &str) -> Option<(ListKind, usize)> {
+    let ind = indent_len(line);
+    let rest = &line[ind..];
+    if rest.starts_with("- ") {
+        return Some((ListKind::Unordered, ind + 2));
+    }
+    let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits > 0 && rest[digits..].starts_with(". ") {
+        Some((ListKind::Ordered, ind + digits + 2))
+    } else {
+        None
+    }
+}
+
+/// True if the line containing char position `pos` is a list item.
+pub fn is_list_line(text: &str, pos: usize) -> bool {
+    let b = char_to_byte(text, pos);
+    let start = text[..b].rfind('\n').map_or(0, |p| p + 1);
+    let end = text[b..].find('\n').map_or(text.len(), |p| b + p);
+    list_marker(&text[start..end]).is_some()
+}
+
+/// Indent (or outdent) every list line touched by `sel`. Returns the new
+/// char selection.
+pub fn shift_list_indent(text: &mut String, sel: Range<usize>, outdent: bool) -> Range<usize> {
+    let a = char_to_byte(text, sel.start);
+    let b = char_to_byte(text, sel.end);
+    let start = text[..a].rfind('\n').map_or(0, |p| p + 1);
+    let end = text[b..].find('\n').map_or(text.len(), |p| b + p);
+    let region = text[start..end].to_string();
+    let mut first_delta = 0i64;
+    let mut total = 0i64;
+    let new_region = region
+        .split('\n')
+        .enumerate()
+        .map(|(i, l)| {
+            let (out, delta) = if list_marker(l).is_none() {
+                (l.to_string(), 0)
+            } else if outdent {
+                let cut = if l.starts_with('\t') {
+                    1
+                } else {
+                    l.bytes().take(INDENT.len()).take_while(|c| *c == b' ').count()
+                };
+                (l[cut..].to_string(), -(cut as i64))
+            } else {
+                (format!("{INDENT}{l}"), INDENT.len() as i64)
+            };
+            if i == 0 {
+                first_delta = delta;
+            }
+            total += delta;
+            out
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let line_start_char = byte_to_char(text, start) as i64;
+    text.replace_range(start..end, &new_region);
+    let s = (sel.start as i64 + first_delta).max(line_start_char) as usize;
+    let e = ((sel.end as i64 + total).max(s as i64)) as usize;
+    s..e
+}
+
 fn char_to_byte(s: &str, c: usize) -> usize {
     s.char_indices().nth(c).map_or(s.len(), |(b, _)| b)
 }
@@ -92,8 +180,12 @@ fn byte_to_char(s: &str, b: usize) -> usize {
 pub fn clean_manuscript(text: &str) -> String {
     let lines: Vec<String> = text
         .lines()
-        .map(|l| l.replace('\t', " ").split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let l = l.replace('\t', INDENT);
+            let keep = if list_marker(&l).is_some() { indent_len(&l) } else { 0 };
+            format!("{}{}", &l[..keep], l.split_whitespace().collect::<Vec<_>>().join(" "))
+        })
+        .filter(|l| !l.trim().is_empty())
         .collect();
     lines.join("\n")
 }
@@ -142,6 +234,56 @@ pub fn toggle_heading(text: &mut String, sel: Range<usize>, level: u8) -> Range<
         })
         .collect();
     let new_region = new_region.join("\n");
+    let new_end_char = byte_to_char(text, start) + new_region.chars().count();
+    text.replace_range(start..end, &new_region);
+    let s = sel.start.min(new_end_char);
+    s..new_end_char.max(s)
+}
+
+/// Turn every line touched by `sel` into a list item, or remove that list
+/// marker when the first non-blank line already has the requested kind.
+/// Numbered lists are renumbered from 1 across the touched non-blank lines.
+pub fn toggle_list(text: &mut String, sel: Range<usize>, kind: ListKind) -> Range<usize> {
+    let a = char_to_byte(text, sel.start);
+    let b = char_to_byte(text, sel.end);
+    let start = text[..a].rfind('\n').map_or(0, |p| p + 1);
+    let end = text[b..].find('\n').map_or(text.len(), |p| b + p);
+    let region = text[start..end].to_string();
+    let lines: Vec<&str> = region.split('\n').collect();
+    let first_kind = lines
+        .iter()
+        .find(|l| !l.trim().is_empty())
+        .and_then(|l| list_marker(l))
+        .map(|(k, _)| k);
+    let target = if first_kind == Some(kind) { None } else { Some(kind) };
+    let mut counts: Vec<(usize, usize)> = Vec::new();
+
+    let new_region = lines
+        .iter()
+        .map(|l| {
+            let ind = indent_len(l);
+            let indent = &l[..ind];
+            let body = list_marker(l).map_or(&l[ind..], |(_, len)| &l[len..]);
+            match target {
+                Some(ListKind::Unordered) if lines.len() == 1 || !l.trim().is_empty() => {
+                    format!("{indent}- {body}")
+                }
+                Some(ListKind::Ordered) if lines.len() == 1 || !l.trim().is_empty() => {
+                    while counts.last().is_some_and(|c| c.0 > ind) {
+                        counts.pop();
+                    }
+                    match counts.last_mut() {
+                        Some(c) if c.0 == ind => c.1 += 1,
+                        _ => counts.push((ind, 1)),
+                    }
+                    format!("{indent}{}. {body}", counts.last().unwrap().1)
+                }
+                Some(_) => (*l).to_string(),
+                None => format!("{indent}{body}"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let new_end_char = byte_to_char(text, start) + new_region.chars().count();
     text.replace_range(start..end, &new_region);
     let s = sel.start.min(new_end_char);
@@ -202,5 +344,35 @@ mod tests {
         assert_eq!(t, "## Title\nbody");
         toggle_heading(&mut t, 0..0, 2);
         assert_eq!(t, "Title\nbody");
+    }
+
+    #[test]
+    fn list_toggle_and_conversion() {
+        let mut t = String::from("one\ntwo\nthree");
+        toggle_list(&mut t, 0..7, ListKind::Unordered);
+        assert_eq!(t, "- one\n- two\nthree");
+        toggle_list(&mut t, 0..7, ListKind::Ordered);
+        assert_eq!(t, "1. one\n2. two\nthree");
+        toggle_list(&mut t, 0..7, ListKind::Ordered);
+        assert_eq!(t, "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn list_indent_and_outdent() {
+        let mut t = String::from("- a\n- b");
+        let sel = shift_list_indent(&mut t, 5..5, false);
+        assert_eq!(t, "- a\n    - b");
+        assert_eq!(sel, 9..9);
+        assert!(is_list_line(&t, 9));
+        shift_list_indent(&mut t, 9..9, true);
+        assert_eq!(t, "- a\n- b");
+        assert_eq!(clean_manuscript("- a\n\t- b\ntext  x"), "- a\n    - b\ntext x");
+    }
+
+    #[test]
+    fn list_markers_are_styled() {
+        let sp = spans("- bullet\n12. number");
+        assert!(sp.iter().any(|(r, s)| s.list && s.marker && r == &(0..2)));
+        assert!(sp.iter().any(|(r, s)| s.list && s.marker && r == &(9..13)));
     }
 }
